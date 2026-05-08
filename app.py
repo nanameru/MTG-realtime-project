@@ -261,19 +261,17 @@ class TranslationWorker(QObject):
         self._cmd_queue: queue.Queue = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self.target_lang = "en"
-        self.input_device: Optional[int] = None
-        self.output_device: Optional[int] = None
 
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self, target_lang, in_dev, out_dev):
+    # Pre-warm: open the WebSocket immediately at app launch and keep it
+    # idle. The next start_audio() bypasses the ~300–500 ms TLS+WS handshake.
+    def preconnect(self, target_lang: str = "en"):
         if self.running:
             return
         self.target_lang = target_lang
-        self.input_device = in_dev
-        self.output_device = out_dev
         self._stop_event.clear()
         while not self._cmd_queue.empty():
             try: self._cmd_queue.get_nowait()
@@ -281,7 +279,16 @@ class TranslationWorker(QObject):
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def start_audio(self, in_dev: Optional[int], out_dev: Optional[int]):
+        if not self.running:
+            self.preconnect(self.target_lang)
+        self._cmd_queue.put({"type": "start_audio", "in": in_dev, "out": out_dev})
+
+    def stop_audio(self):
+        if self.running:
+            self._cmd_queue.put({"type": "stop_audio"})
+
+    def shutdown(self):
         self._stop_event.set()
         self._cmd_queue.put({"type": "stop"})
 
@@ -334,18 +341,19 @@ class TranslationWorker(QObject):
                     },
                 },
             }))
-            self.status_changed.emit("connected")
+            self.status_changed.emit("ready")  # connected, idle, awaiting Start
 
             loop = asyncio.get_event_loop()
             audio_q: asyncio.Queue = asyncio.Queue()
-
-            # ── playback: deque + sounddevice callback ──────────────
-            # never block the WS receiver on OutputStream.write.
             playback_buf = collections.deque()
             playback_lock = threading.Lock()
 
+            # streams are opened/closed on demand via cmd_processor
+            in_stream: Optional[sd.InputStream] = None
+            out_stream: Optional[sd.OutputStream] = None
+            sender_active = threading.Event()  # gate: only emit audio when live
+
             def out_cb(outdata, frames, time_info, status):
-                # outdata is shape (frames, CHANNELS) int16
                 needed = frames
                 produced = 0
                 with playback_lock:
@@ -359,9 +367,11 @@ class TranslationWorker(QObject):
                             playback_buf[0] = chunk[take:]
                         produced += take
                 if produced < needed:
-                    outdata[produced:, 0] = 0  # silence pad
+                    outdata[produced:, 0] = 0
 
             def mic_cb(indata, frames, time_info, status):
+                if not sender_active.is_set():
+                    return
                 pcm16 = (indata[:, 0] * 32767).astype(np.int16).tobytes()
                 level = float(np.abs(indata).mean())
                 try:
@@ -369,20 +379,41 @@ class TranslationWorker(QObject):
                 except RuntimeError:
                     pass
 
-            out_stream = sd.OutputStream(
-                samplerate=SAMPLE_RATE, channels=CHANNELS,
-                dtype="int16", device=self.output_device,
-                blocksize=OUTPUT_BLOCK_SAMPLES, latency=AUDIO_LATENCY,
-                callback=out_cb,
-            )
-            out_stream.start()
-            in_stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=CHANNELS,
-                dtype="float32", device=self.input_device,
-                blocksize=CHUNK_SAMPLES, latency=AUDIO_LATENCY,
-                callback=mic_cb,
-            )
-            in_stream.start()
+            def open_streams(in_dev: Optional[int], out_dev: Optional[int]):
+                nonlocal in_stream, out_stream
+                if in_stream is not None:
+                    return
+                with playback_lock:
+                    playback_buf.clear()
+                out_stream = sd.OutputStream(
+                    samplerate=SAMPLE_RATE, channels=CHANNELS,
+                    dtype="int16", device=out_dev,
+                    blocksize=OUTPUT_BLOCK_SAMPLES, latency=AUDIO_LATENCY,
+                    callback=out_cb,
+                )
+                out_stream.start()
+                in_stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE, channels=CHANNELS,
+                    dtype="float32", device=in_dev,
+                    blocksize=CHUNK_SAMPLES, latency=AUDIO_LATENCY,
+                    callback=mic_cb,
+                )
+                in_stream.start()
+                sender_active.set()
+
+            def close_streams():
+                nonlocal in_stream, out_stream
+                sender_active.clear()
+                if in_stream is not None:
+                    try: in_stream.stop(); in_stream.close()
+                    except Exception: pass
+                    in_stream = None
+                if out_stream is not None:
+                    try: out_stream.stop(); out_stream.close()
+                    except Exception: pass
+                    out_stream = None
+                with playback_lock:
+                    playback_buf.clear()
 
             stop_flag = self._stop_event
 
@@ -392,6 +423,8 @@ class TranslationWorker(QObject):
                     try:
                         pcm16, level = await asyncio.wait_for(audio_q.get(), timeout=0.1)
                     except asyncio.TimeoutError:
+                        continue
+                    if not sender_active.is_set():
                         continue
                     await ws.send(json.dumps({
                         "type": "session.input_audio_buffer.append",
@@ -452,11 +485,18 @@ class TranslationWorker(QObject):
                     try:
                         cmd = self._cmd_queue.get_nowait()
                     except queue.Empty:
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.05)
                         continue
-                    if cmd["type"] == "stop":
+                    t = cmd["type"]
+                    if t == "stop":
                         break
-                    if cmd["type"] == "set_lang":
+                    elif t == "start_audio":
+                        open_streams(cmd["in"], cmd["out"])
+                        self.status_changed.emit("live")
+                    elif t == "stop_audio":
+                        close_streams()
+                        self.status_changed.emit("ready")
+                    elif t == "set_lang":
                         await ws.send(json.dumps({
                             "type": "session.update",
                             "session": {"audio": {"output": {"language": cmd["lang"]}}},
@@ -465,10 +505,7 @@ class TranslationWorker(QObject):
             try:
                 await asyncio.gather(sender(), receiver(), cmd_processor())
             finally:
-                try: in_stream.stop(); in_stream.close()
-                except Exception: pass
-                try: out_stream.stop(); out_stream.close()
-                except Exception: pass
+                close_streams()
 
 
 # -------- helpers --------
@@ -498,6 +535,9 @@ class MainWindow(QMainWindow):
         self.worker.language_confirmed.connect(self.on_lang_confirmed)
 
         self._build_ui()
+        # Pre-warm the WebSocket the moment the window appears so the first
+        # Start click hits an already-handshaked, session.updated connection.
+        self.worker.preconnect(self.lang_combo.currentData())
 
     def _build_ui(self):
         central = QWidget()
@@ -608,18 +648,18 @@ class MainWindow(QMainWindow):
     # ── handlers ──────────────────────────────────────────────
     @Slot()
     def on_start(self):
-        lang = self.lang_combo.currentData()
         in_dev = self.input_combo.currentData()
         out_dev = self.output_combo.currentData()
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.input_combo.setEnabled(False)
         self.output_combo.setEnabled(False)
-        self.worker.start(lang, in_dev, out_dev)
+        # WS is already pre-warmed; this only flips on the audio streams.
+        self.worker.start_audio(in_dev, out_dev)
 
     @Slot()
     def on_stop(self):
-        self.worker.stop()
+        self.worker.stop_audio()
         self.stop_btn.setEnabled(False)
 
     @Slot(int)
@@ -631,17 +671,26 @@ class MainWindow(QMainWindow):
     def on_status(self, status: str):
         color, text = {
             "connecting":   (COL_TEXT_DIM, "Connecting…"),
-            "connected":    (COL_ACCENT,   "Live"),
+            "ready":        ("#f4b740",    "Ready"),
+            "live":         (COL_ACCENT,   "Live"),
             "disconnected": (COL_TEXT_DIM, "Idle"),
         }.get(status, (COL_TEXT_DIM, status))
         self.status_dot.set_color(color)
         self.status_label.setText(text)
-        if status == "disconnected":
+        if status == "ready":
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.input_combo.setEnabled(True)
             self.output_combo.setEnabled(True)
             self.level_bar.setValue(0)
+        elif status == "disconnected":
+            # WS dropped — relaunch in the background so the next Start works.
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.input_combo.setEnabled(True)
+            self.output_combo.setEnabled(True)
+            self.level_bar.setValue(0)
+            self.worker.preconnect(self.lang_combo.currentData())
 
     @Slot(str)
     def on_transcript_delta(self, delta: str):
@@ -684,7 +733,7 @@ class MainWindow(QMainWindow):
                 break
 
     def closeEvent(self, event):
-        self.worker.stop()
+        self.worker.shutdown()
         event.accept()
 
 
