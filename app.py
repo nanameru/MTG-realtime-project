@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import collections
 import json
 import os
 import queue
@@ -25,8 +26,11 @@ load_dotenv()
 
 SAMPLE_RATE = 24000
 CHANNELS = 1
-CHUNK_MS = 40
+CHUNK_MS = 20                              # mic → WS chunk size
 CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000
+OUTPUT_BLOCK_MS = 20                       # OutputStream callback block size
+OUTPUT_BLOCK_SAMPLES = SAMPLE_RATE * OUTPUT_BLOCK_MS // 1000
+AUDIO_LATENCY = "low"                      # PortAudio: ask for smallest OS buffer
 MODEL = "gpt-realtime-translate"
 WS_URL = f"wss://api.openai.com/v1/realtime/translations?model={MODEL}"
 
@@ -303,20 +307,65 @@ class TranslationWorker(QObject):
         self.status_changed.emit("connecting")
         headers = {"Authorization": f"Bearer {api_key}"}
 
-        async with websockets.connect(WS_URL, additional_headers=headers, max_size=None) as ws:
+        async with websockets.connect(
+            WS_URL,
+            additional_headers=headers,
+            max_size=2 ** 22,
+            compression=None,
+            ping_interval=20,
+            ping_timeout=20,
+        ) as ws:
             first = json.loads(await ws.recv())
             if first.get("type") != "session.created":
                 self.error_occurred.emit(f"Unexpected first message: {first.get('type')}")
                 return
 
+            # session.update — translation sessions use the transcription-style
+            # schema. turn_detection is NOT honored here (translation streams
+            # output continuously). The fields that matter for latency are:
+            #   * audio.input.noise_reduction.type = "near_field"
+            #   * audio.input.transcription.delay = "minimal"
             await ws.send(json.dumps({
                 "type": "session.update",
-                "session": {"audio": {"output": {"language": self.target_lang}}},
+                "session": {
+                    "audio": {
+                        "input": {
+                            "noise_reduction": {"type": "near_field"},
+                            "transcription": {
+                                "model": "gpt-realtime-whisper",
+                                "delay": "minimal",
+                            },
+                        },
+                        "output": {"language": self.target_lang},
+                    },
+                },
             }))
             self.status_changed.emit("connected")
 
             loop = asyncio.get_event_loop()
             audio_q: asyncio.Queue = asyncio.Queue()
+
+            # ── playback: deque + sounddevice callback ──────────────
+            # never block the WS receiver on OutputStream.write.
+            playback_buf = collections.deque()
+            playback_lock = threading.Lock()
+
+            def out_cb(outdata, frames, time_info, status):
+                # outdata is shape (frames, CHANNELS) int16
+                needed = frames
+                produced = 0
+                with playback_lock:
+                    while produced < needed and playback_buf:
+                        chunk = playback_buf[0]
+                        take = min(len(chunk), needed - produced)
+                        outdata[produced:produced + take, 0] = chunk[:take]
+                        if take == len(chunk):
+                            playback_buf.popleft()
+                        else:
+                            playback_buf[0] = chunk[take:]
+                        produced += take
+                if produced < needed:
+                    outdata[produced:, 0] = 0  # silence pad
 
             def mic_cb(indata, frames, time_info, status):
                 pcm16 = (indata[:, 0] * 32767).astype(np.int16).tobytes()
@@ -329,12 +378,15 @@ class TranslationWorker(QObject):
             out_stream = sd.OutputStream(
                 samplerate=SAMPLE_RATE, channels=CHANNELS,
                 dtype="int16", device=self.output_device,
+                blocksize=OUTPUT_BLOCK_SAMPLES, latency=AUDIO_LATENCY,
+                callback=out_cb,
             )
             out_stream.start()
             in_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=CHANNELS,
                 dtype="float32", device=self.input_device,
-                blocksize=CHUNK_SAMPLES, callback=mic_cb,
+                blocksize=CHUNK_SAMPLES, latency=AUDIO_LATENCY,
+                callback=mic_cb,
             )
             in_stream.start()
 
@@ -378,8 +430,8 @@ class TranslationWorker(QObject):
                         audio_b64 = msg.get("delta") or msg.get("audio") or ""
                         if audio_b64:
                             pcm = np.frombuffer(base64.b64decode(audio_b64), dtype=np.int16)
-                            try: out_stream.write(pcm)
-                            except Exception: pass
+                            with playback_lock:
+                                playback_buf.append(pcm)
 
                     elif etype in (
                         "response.audio_transcript.delta", "response.output_text.delta",
