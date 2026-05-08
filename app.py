@@ -67,7 +67,7 @@ COL_DANGER      = "#ef4146"
 
 QSS = f"""
 * {{
-    font-family: -apple-system, "SF Pro Text", "Inter", "Helvetica Neue", sans-serif;
+    font-family: ".AppleSystemUIFont", "SF Pro Text", "Helvetica Neue", "Inter", sans-serif;
     color: {COL_TEXT};
 }}
 QMainWindow, QWidget#central {{
@@ -320,22 +320,16 @@ class TranslationWorker(QObject):
                 self.error_occurred.emit(f"Unexpected first message: {first.get('type')}")
                 return
 
-            # session.update — translation sessions use the transcription-style
-            # schema. turn_detection is NOT honored here (translation streams
-            # output continuously). The fields that matter for latency are:
-            #   * audio.input.noise_reduction.type = "near_field"
-            #   * audio.input.transcription.delay = "minimal"
+            # session.update — translation endpoint accepts only:
+            #   * audio.input.noise_reduction.type ("near_field" | "far_field")
+            #   * audio.output.language
+            # Other sub-fields (turn_detection, transcription.delay, voice,
+            # format, output_modalities, top-level translation) are rejected.
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
                     "audio": {
-                        "input": {
-                            "noise_reduction": {"type": "near_field"},
-                            "transcription": {
-                                "model": "gpt-realtime-whisper",
-                                "delay": "minimal",
-                            },
-                        },
+                        "input": {"noise_reduction": {"type": "near_field"}},
                         "output": {"language": self.target_lang},
                     },
                 },
