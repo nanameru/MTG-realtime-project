@@ -44,7 +44,11 @@ VAD_THRESHOLD          = 0.5
 VAD_MIN_SILENCE_MS     = 320               # silence run before declaring end-of-speech
 VAD_LOOKBACK_MS        = 240               # pre-roll prepended on speech start so we don't clip onsets
 VAD_LOOKBACK_CHUNKS    = VAD_LOOKBACK_MS // CHUNK_MS
-VAD_SEND_COMMIT        = True              # send session.input_audio_buffer.commit on end-of-speech
+# Translation endpoint rejects manual `input_audio_buffer.commit`. Instead,
+# after our local VAD detects end-of-speech we ship a short tail of digital
+# silence so the *server* VAD trips its own end-of-utterance and commits.
+VAD_SILENCE_TAIL_MS     = 800
+VAD_SILENCE_TAIL_CHUNKS = VAD_SILENCE_TAIL_MS // CHUNK_MS
 
 LANGUAGES = [
     ("English",     "en"),
@@ -393,8 +397,9 @@ class TranslationWorker(QObject):
 
             vad_buf_24k = np.zeros(0, dtype=np.float32)
             vad_lookback: collections.deque = collections.deque(maxlen=VAD_LOOKBACK_CHUNKS)
-            vad_state = {"in_speech": False}
+            vad_state = {"in_speech": False, "tail_remaining": 0}
             mic_emit_count = {"n": 0}
+            silent_pcm16 = np.zeros(CHUNK_SAMPLES, dtype=np.int16).tobytes()
 
             def vad_reset():
                 nonlocal vad_buf_24k
@@ -402,14 +407,7 @@ class TranslationWorker(QObject):
                 vad_buf_24k = np.zeros(0, dtype=np.float32)
                 vad_lookback.clear()
                 vad_state["in_speech"] = False
-
-            def schedule_ws(payload: dict):
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        ws.send(json.dumps(payload)), loop,
-                    )
-                except Exception:
-                    pass
+                vad_state["tail_remaining"] = 0
 
             def out_cb(outdata, frames, time_info, status):
                 needed = frames
@@ -455,6 +453,7 @@ class TranslationWorker(QObject):
                         continue
                     if "start" in evt and not vad_state["in_speech"]:
                         vad_state["in_speech"] = True
+                        vad_state["tail_remaining"] = 0  # cancel any in-flight silence tail
                         # Flush pre-roll so the model hears the first phoneme.
                         while vad_lookback:
                             pre_pcm, pre_level = vad_lookback.popleft()
@@ -466,12 +465,19 @@ class TranslationWorker(QObject):
                                 pass
                     elif "end" in evt and vad_state["in_speech"]:
                         vad_state["in_speech"] = False
-                        if VAD_SEND_COMMIT:
-                            schedule_ws({"type": "session.input_audio_buffer.commit"})
+                        # Schedule a digital-silence tail so the server-side
+                        # VAD trips end-of-utterance immediately.
+                        vad_state["tail_remaining"] = VAD_SILENCE_TAIL_CHUNKS
 
                 if vad_state["in_speech"]:
                     try:
                         loop.call_soon_threadsafe(audio_q.put_nowait, (pcm16, level))
+                    except RuntimeError:
+                        pass
+                elif vad_state["tail_remaining"] > 0:
+                    vad_state["tail_remaining"] -= 1
+                    try:
+                        loop.call_soon_threadsafe(audio_q.put_nowait, (silent_pcm16, 0.0))
                     except RuntimeError:
                         pass
                 else:
@@ -503,11 +509,6 @@ class TranslationWorker(QObject):
             def close_streams():
                 nonlocal in_stream, out_stream
                 sender_active.clear()
-                # If we cut while still mid-utterance, ask the server to
-                # commit whatever's already buffered so the user gets the
-                # tail translation instead of it disappearing on stop.
-                if vad_state["in_speech"] and VAD_SEND_COMMIT:
-                    schedule_ws({"type": "session.input_audio_buffer.commit"})
                 vad_reset()
                 if in_stream is not None:
                     try: in_stream.stop(); in_stream.close()
