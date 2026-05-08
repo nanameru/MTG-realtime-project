@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""MTG Realtime Translator — desktop app.
-
-GUI front-end for OpenAI gpt-realtime-translate. Lets you:
-- pick input/output audio devices
-- pick output language from a dropdown (live-switchable via session.update)
-- see translation text streamed in real time
-- see live mic level
-
-Run:
-    python app.py
-"""
+"""MTG Realtime Translator — desktop app (OpenAI-styled)."""
 
 import asyncio
 import base64
@@ -25,9 +15,9 @@ import sounddevice as sd
 import websockets
 from dotenv import load_dotenv
 from PySide6.QtCore import Qt, QObject, Signal, Slot
-from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtGui import QFont, QFontDatabase, QTextCursor, QIcon, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QHBoxLayout, QLabel, QMainWindow,
+    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow,
     QProgressBar, QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -58,11 +48,203 @@ LANGUAGES = [
     ("Türkçe",      "tr"),
 ]
 
+# OpenAI-inspired palette
+COL_BG          = "#0d0d0d"
+COL_SURFACE     = "#171717"
+COL_SURFACE_2   = "#1f1f1f"
+COL_BORDER      = "#2a2a2a"
+COL_BORDER_HI   = "#3a3a3a"
+COL_TEXT        = "#ececec"
+COL_TEXT_DIM    = "#8e8ea0"
+COL_ACCENT      = "#10a37f"   # OpenAI green
+COL_ACCENT_HOV  = "#0e8e6e"
+COL_ACCENT_DIM  = "#1f3a32"
+COL_DANGER      = "#ef4146"
+
+QSS = f"""
+* {{
+    font-family: -apple-system, "SF Pro Text", "Inter", "Helvetica Neue", sans-serif;
+    color: {COL_TEXT};
+}}
+QMainWindow, QWidget#central {{
+    background: {COL_BG};
+}}
+QLabel {{
+    background: transparent;
+    font-size: 13px;
+}}
+QLabel#title {{
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+}}
+QLabel#caption {{
+    color: {COL_TEXT_DIM};
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+}}
+QLabel#status {{
+    color: {COL_TEXT_DIM};
+    font-size: 12px;
+    font-weight: 500;
+}}
+
+QFrame#divider {{
+    background: {COL_BORDER};
+    max-height: 1px;
+    min-height: 1px;
+    border: none;
+}}
+
+QComboBox {{
+    background: {COL_SURFACE};
+    border: 1px solid {COL_BORDER};
+    border-radius: 10px;
+    padding: 8px 12px;
+    font-size: 13px;
+    min-height: 20px;
+}}
+QComboBox:hover {{
+    border-color: {COL_BORDER_HI};
+}}
+QComboBox:focus {{
+    border-color: {COL_ACCENT};
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: 22px;
+}}
+QComboBox::down-arrow {{
+    image: none;
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid {COL_TEXT_DIM};
+    margin-right: 8px;
+}}
+QComboBox QAbstractItemView {{
+    background: {COL_SURFACE};
+    border: 1px solid {COL_BORDER};
+    border-radius: 10px;
+    padding: 4px;
+    outline: none;
+    selection-background-color: {COL_SURFACE_2};
+}}
+
+QPushButton {{
+    background: {COL_SURFACE};
+    border: 1px solid {COL_BORDER};
+    border-radius: 18px;
+    padding: 8px 18px;
+    font-size: 13px;
+    font-weight: 500;
+    min-height: 18px;
+}}
+QPushButton:hover {{
+    background: {COL_SURFACE_2};
+    border-color: {COL_BORDER_HI};
+}}
+QPushButton:disabled {{
+    color: #4a4a4a;
+    border-color: {COL_BORDER};
+}}
+
+QPushButton#primary {{
+    background: {COL_ACCENT};
+    color: #ffffff;
+    border: none;
+    font-weight: 600;
+    padding: 10px 24px;
+    border-radius: 20px;
+}}
+QPushButton#primary:hover {{
+    background: {COL_ACCENT_HOV};
+}}
+QPushButton#primary:disabled {{
+    background: {COL_ACCENT_DIM};
+    color: #6a8c80;
+}}
+
+QPushButton#stop {{
+    background: transparent;
+    border: 1px solid {COL_BORDER_HI};
+    color: {COL_TEXT};
+    border-radius: 20px;
+    padding: 10px 22px;
+    font-weight: 500;
+}}
+QPushButton#stop:hover {{
+    background: {COL_SURFACE};
+}}
+
+QTextEdit {{
+    background: {COL_SURFACE};
+    color: {COL_TEXT};
+    border: 1px solid {COL_BORDER};
+    border-radius: 14px;
+    padding: 20px 22px;
+    font-size: 16px;
+    selection-background-color: {COL_ACCENT_DIM};
+}}
+QTextEdit:focus {{
+    border-color: {COL_BORDER_HI};
+}}
+
+QProgressBar {{
+    background: {COL_SURFACE_2};
+    border: none;
+    border-radius: 2px;
+    max-height: 4px;
+}}
+QProgressBar::chunk {{
+    background: {COL_ACCENT};
+    border-radius: 2px;
+}}
+
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+    margin: 4px;
+}}
+QScrollBar::handle:vertical {{
+    background: {COL_BORDER_HI};
+    border-radius: 4px;
+    min-height: 30px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {COL_TEXT_DIM};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0;
+}}
+"""
+
+
+class StatusDot(QLabel):
+    """A small colored circle indicating connection state."""
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(10, 10)
+        self.set_color(COL_TEXT_DIM)
+
+    def set_color(self, color: str):
+        pm = QPixmap(10, 10)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(color))
+        p.drawEllipse(0, 0, 10, 10)
+        p.end()
+        self.setPixmap(pm)
+
+
+# -------- worker (unchanged logic, only signals) --------
 
 class TranslationWorker(QObject):
-    """Runs the websocket session in a background thread; talks to GUI via signals."""
-
-    status_changed     = Signal(str)   # "connecting" | "connected" | "disconnected"
+    status_changed     = Signal(str)
     transcript_delta   = Signal(str)
     transcript_done    = Signal()
     mic_level          = Signal(float)
@@ -82,7 +264,7 @@ class TranslationWorker(QObject):
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self, target_lang: str, in_dev: Optional[int], out_dev: Optional[int]):
+    def start(self, target_lang, in_dev, out_dev):
         if self.running:
             return
         self.target_lang = target_lang
@@ -90,10 +272,8 @@ class TranslationWorker(QObject):
         self.output_device = out_dev
         self._stop_event.clear()
         while not self._cmd_queue.empty():
-            try:
-                self._cmd_queue.get_nowait()
-            except queue.Empty:
-                break
+            try: self._cmd_queue.get_nowait()
+            except queue.Empty: break
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -131,11 +311,8 @@ class TranslationWorker(QObject):
 
             await ws.send(json.dumps({
                 "type": "session.update",
-                "session": {
-                    "audio": {"output": {"language": self.target_lang}},
-                },
+                "session": {"audio": {"output": {"language": self.target_lang}}},
             }))
-
             self.status_changed.emit("connected")
 
             loop = asyncio.get_event_loop()
@@ -154,7 +331,6 @@ class TranslationWorker(QObject):
                 dtype="int16", device=self.output_device,
             )
             out_stream.start()
-
             in_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=CHANNELS,
                 dtype="float32", device=self.input_device,
@@ -190,31 +366,24 @@ class TranslationWorker(QObject):
 
                     if etype == "session.updated":
                         sess = msg.get("session", {})
-                        out_lang = (
-                            sess.get("audio", {}).get("output", {}).get("language")
-                            or sess.get("output_language")
-                        )
+                        out_lang = sess.get("audio", {}).get("output", {}).get("language") \
+                                   or sess.get("output_language")
                         if out_lang:
                             self.language_confirmed.emit(out_lang)
 
                     elif etype in (
-                        "response.audio.delta",
-                        "response.output_audio.delta",
+                        "response.audio.delta", "response.output_audio.delta",
                         "session.output_audio.delta",
                     ):
                         audio_b64 = msg.get("delta") or msg.get("audio") or ""
                         if audio_b64:
                             pcm = np.frombuffer(base64.b64decode(audio_b64), dtype=np.int16)
-                            try:
-                                out_stream.write(pcm)
-                            except Exception:
-                                pass
+                            try: out_stream.write(pcm)
+                            except Exception: pass
 
                     elif etype in (
-                        "response.audio_transcript.delta",
-                        "response.output_text.delta",
-                        "response.text.delta",
-                        "session.output_transcript.delta",
+                        "response.audio_transcript.delta", "response.output_text.delta",
+                        "response.text.delta", "session.output_transcript.delta",
                         "session.output_text.delta",
                     ):
                         delta = msg.get("delta", "")
@@ -222,10 +391,8 @@ class TranslationWorker(QObject):
                             self.transcript_delta.emit(delta)
 
                     elif etype in (
-                        "response.audio_transcript.done",
-                        "response.output_text.done",
-                        "response.text.done",
-                        "session.output_transcript.done",
+                        "response.audio_transcript.done", "response.output_text.done",
+                        "response.text.done", "session.output_transcript.done",
                         "session.output_text.done",
                     ):
                         self.transcript_done.emit()
@@ -246,45 +413,35 @@ class TranslationWorker(QObject):
                     if cmd["type"] == "set_lang":
                         await ws.send(json.dumps({
                             "type": "session.update",
-                            "session": {
-                                "audio": {"output": {"language": cmd["lang"]}},
-                            },
+                            "session": {"audio": {"output": {"language": cmd["lang"]}}},
                         }))
 
             try:
                 await asyncio.gather(sender(), receiver(), cmd_processor())
             finally:
-                try:
-                    in_stream.stop(); in_stream.close()
-                except Exception:
-                    pass
-                try:
-                    out_stream.stop(); out_stream.close()
-                except Exception:
-                    pass
+                try: in_stream.stop(); in_stream.close()
+                except Exception: pass
+                try: out_stream.stop(); out_stream.close()
+                except Exception: pass
 
+
+# -------- helpers --------
 
 def list_input_devices():
-    out = []
-    for idx, dev in enumerate(sd.query_devices()):
-        if dev["max_input_channels"] > 0:
-            out.append((idx, dev["name"]))
-    return out
-
+    return [(i, d["name"]) for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
 
 def list_output_devices():
-    out = []
-    for idx, dev in enumerate(sd.query_devices()):
-        if dev["max_output_channels"] > 0:
-            out.append((idx, dev["name"]))
-    return out
+    return [(i, d["name"]) for i, d in enumerate(sd.query_devices()) if d["max_output_channels"] > 0]
 
+
+# -------- main window --------
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MTG Realtime Translator")
-        self.resize(820, 600)
+        self.setWindowTitle("Realtime Translator")
+        self.resize(880, 660)
+        self.setMinimumSize(640, 480)
 
         self.worker = TranslationWorker()
         self.worker.status_changed.connect(self.on_status)
@@ -298,84 +455,111 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         central = QWidget()
+        central.setObjectName("central")
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(28, 24, 28, 24)
+        root.setSpacing(18)
 
-        # Row 1: language + start/stop
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Translate to:"))
+        # ── header ─────────────────────────────────────────────
+        header = QHBoxLayout()
+        header.setSpacing(10)
+
+        title = QLabel("Realtime Translator")
+        title.setObjectName("title")
+        header.addWidget(title)
+        header.addStretch(1)
+
+        self.status_dot = StatusDot()
+        header.addWidget(self.status_dot)
+        self.status_label = QLabel("Idle")
+        self.status_label.setObjectName("status")
+        header.addWidget(self.status_label)
+        root.addLayout(header)
+
+        div = QFrame(); div.setObjectName("divider")
+        root.addWidget(div)
+
+        # ── controls (language + devices) ──────────────────────
+        controls = QHBoxLayout()
+        controls.setSpacing(20)
+
+        # language column
+        lang_col = QVBoxLayout(); lang_col.setSpacing(6)
+        cap_lang = QLabel("Output language"); cap_lang.setObjectName("caption")
+        lang_col.addWidget(cap_lang)
         self.lang_combo = QComboBox()
         for label, code in LANGUAGES:
-            self.lang_combo.addItem(f"{label}  ({code})", code)
+            self.lang_combo.addItem(f"{label}  ·  {code}", code)
         self.lang_combo.setCurrentIndex(0)
         self.lang_combo.currentIndexChanged.connect(self.on_lang_changed)
-        row1.addWidget(self.lang_combo, 1)
+        lang_col.addWidget(self.lang_combo)
+        controls.addLayout(lang_col, 1)
 
-        self.start_btn = QPushButton("Start")
-        self.start_btn.clicked.connect(self.on_start)
-        row1.addWidget(self.start_btn)
-
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.clicked.connect(self.on_stop)
-        self.stop_btn.setEnabled(False)
-        row1.addWidget(self.stop_btn)
-        layout.addLayout(row1)
-
-        # Row 2: devices
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Mic:"))
+        # mic column
+        mic_col = QVBoxLayout(); mic_col.setSpacing(6)
+        cap_mic = QLabel("Input"); cap_mic.setObjectName("caption")
+        mic_col.addWidget(cap_mic)
         self.input_combo = QComboBox()
-        self.input_combo.addItem("default", None)
+        self.input_combo.addItem("System default", None)
         for idx, name in list_input_devices():
             self.input_combo.addItem(name, idx)
-        row2.addWidget(self.input_combo, 1)
+        mic_col.addWidget(self.input_combo)
+        controls.addLayout(mic_col, 1)
 
-        row2.addWidget(QLabel("Output:"))
+        # output column
+        out_col = QVBoxLayout(); out_col.setSpacing(6)
+        cap_out = QLabel("Output"); cap_out.setObjectName("caption")
+        out_col.addWidget(cap_out)
         self.output_combo = QComboBox()
-        self.output_combo.addItem("default", None)
+        self.output_combo.addItem("System default", None)
         for idx, name in list_output_devices():
             self.output_combo.addItem(name, idx)
-        row2.addWidget(self.output_combo, 1)
-        layout.addLayout(row2)
+        out_col.addWidget(self.output_combo)
+        controls.addLayout(out_col, 1)
 
-        # Row 3: status + mic level
-        row3 = QHBoxLayout()
-        self.status_label = QLabel("● disconnected")
-        self.status_label.setStyleSheet("color: gray; font-weight: bold;")
-        row3.addWidget(self.status_label)
+        root.addLayout(controls)
 
-        row3.addWidget(QLabel("Mic:"))
-        self.level_bar = QProgressBar()
-        self.level_bar.setRange(0, 100)
-        self.level_bar.setValue(0)
-        self.level_bar.setTextVisible(False)
-        self.level_bar.setFixedHeight(14)
-        row3.addWidget(self.level_bar, 1)
-        layout.addLayout(row3)
+        # ── transcript ─────────────────────────────────────────
+        cap_trans = QLabel("Translation"); cap_trans.setObjectName("caption")
+        root.addWidget(cap_trans)
 
-        # Transcript
-        layout.addWidget(QLabel("Translation"))
         self.transcript = QTextEdit()
         self.transcript.setReadOnly(True)
-        font = QFont()
-        font.setPointSize(15)
-        self.transcript.setFont(font)
-        self.transcript.setStyleSheet(
-            "QTextEdit { background: #1e1e1e; color: #f5f5f5; border-radius: 8px; padding: 12px; }"
-        )
-        layout.addWidget(self.transcript, 1)
+        f = QFont(); f.setPointSize(16); f.setWeight(QFont.Normal)
+        self.transcript.setFont(f)
+        root.addWidget(self.transcript, 1)
 
-        # Bottom row: clear button
-        row4 = QHBoxLayout()
-        row4.addStretch(1)
-        clear_btn = QPushButton("Clear")
-        clear_btn.clicked.connect(lambda: self.transcript.clear())
-        row4.addWidget(clear_btn)
-        layout.addLayout(row4)
+        # ── footer (mic level + actions) ───────────────────────
+        footer = QHBoxLayout(); footer.setSpacing(14)
 
-    # --- handlers ---
+        level_box = QVBoxLayout(); level_box.setSpacing(4)
+        cap_level = QLabel("MIC LEVEL"); cap_level.setObjectName("caption")
+        level_box.addWidget(cap_level)
+        self.level_bar = QProgressBar()
+        self.level_bar.setRange(0, 100); self.level_bar.setValue(0)
+        self.level_bar.setTextVisible(False)
+        level_box.addWidget(self.level_bar)
+        footer.addLayout(level_box, 1)
+
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.clicked.connect(lambda: self.transcript.clear())
+        footer.addWidget(self.clear_btn)
+
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setObjectName("stop")
+        self.stop_btn.clicked.connect(self.on_stop)
+        self.stop_btn.setEnabled(False)
+        footer.addWidget(self.stop_btn)
+
+        self.start_btn = QPushButton("Start")
+        self.start_btn.setObjectName("primary")
+        self.start_btn.clicked.connect(self.on_start)
+        footer.addWidget(self.start_btn)
+
+        root.addLayout(footer)
+
+    # ── handlers ──────────────────────────────────────────────
     @Slot()
     def on_start(self):
         lang = self.lang_combo.currentData()
@@ -399,9 +583,13 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def on_status(self, status: str):
-        color = {"connecting": "orange", "connected": "#3ddc84", "disconnected": "gray"}.get(status, "gray")
-        self.status_label.setText(f"● {status}")
-        self.status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+        color, text = {
+            "connecting":   (COL_TEXT_DIM, "Connecting…"),
+            "connected":    (COL_ACCENT,   "Live"),
+            "disconnected": (COL_TEXT_DIM, "Idle"),
+        }.get(status, (COL_TEXT_DIM, status))
+        self.status_dot.set_color(color)
+        self.status_label.setText(text)
         if status == "disconnected":
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
@@ -421,7 +609,7 @@ class MainWindow(QMainWindow):
     def on_transcript_done(self):
         cursor = self.transcript.textCursor()
         cursor.movePosition(QTextCursor.End)
-        cursor.insertText("\n")
+        cursor.insertText("\n\n")
         self.transcript.setTextCursor(cursor)
         self.transcript.ensureCursorVisible()
 
@@ -433,13 +621,14 @@ class MainWindow(QMainWindow):
     def on_error(self, msg: str):
         cursor = self.transcript.textCursor()
         cursor.movePosition(QTextCursor.End)
-        cursor.insertHtml(f'<span style="color:#ff6b6b;">[error] {msg}</span><br>')
+        cursor.insertHtml(
+            f'<div style="color:{COL_DANGER};font-size:13px;">⚠ {msg}</div><br>'
+        )
         self.transcript.setTextCursor(cursor)
         self.transcript.ensureCursorVisible()
 
     @Slot(str)
     def on_lang_confirmed(self, lang: str):
-        # ensure dropdown reflects what server confirmed (in case it was different)
         for i in range(self.lang_combo.count()):
             if self.lang_combo.itemData(i) == lang:
                 if self.lang_combo.currentIndex() != i:
@@ -455,7 +644,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("MTG Realtime Translator")
+    app.setApplicationName("Realtime Translator")
+    app.setStyleSheet(QSS)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
