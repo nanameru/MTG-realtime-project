@@ -3,3 +3,6 @@ sounddevice>=0.4.6
 websockets>=12.0
 python-dotenv>=1.0
 PySide6>=6.6
+silero-vad>=5.1
+scipy>=1.10
+onnxruntime>=1.16
